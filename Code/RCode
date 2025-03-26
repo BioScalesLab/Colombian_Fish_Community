@@ -1,1 +1,1233 @@
+# Fish Assemblages Colombian Pacific
+# Script development by Juan P. Quimbayo
+# Date: 2025-03-25
+
+rm(list=ls())
+
+# Data manipulation 
+library (plyr)
+library (dplyr)
+library (reshape)
+library (reshape2)
+
+# Analysis
+library (vegan)
+library (Rmisc)
+library (BiodiversityR)
+library (car)
+library (lme4)
+library (MuMIn)
+library (effects)
+library (multcomp)
+
+# Figures packages
+library (ggpubr)
+library (ggplot2)
+library (RColorBrewer)
+library (fmsb)
+library (scales)
+library (corrplot) 
+
+# Report results
+library (modelsummary)
+
+# 1. Call data ------------------------------------------------------------
+
+db       <- read.csv   ("RawData/Database_colombian_pacific_complete.csv", header = TRUE, sep=",", dec = ".")
+coor_loc <- read.table ("RawData/information_locality.txt", header = TRUE, dec = ',')
+traits   <- read.csv   ("RawData/Traits_species.csv", header = T, dec=".", sep=",")
+
+# Fish families
+family <- data.frame (genus_species=unique(db$genus_species))
+family <- merge (family, traits[,c("genus_species","family")], by="genus_species") 
+
+
+# Joint visual censuses database and species trait information
+
+db <- left_join(db, traits)
+
+# Creating an ID unique per transect 
+db$transect_id <- paste (db$locality, db$year, db$sites, db$transect_id, sep="_")
+
+
+# 2. Estimating minimal sampling area per location --------------------------
+# IMPORTANT
+# Sites with smaller sampling area were Amargal and Piedra Oswaldo (250m2)
+uvc_sites <-  ddply (db,. (sites, area_uvc), summarize, 
+                     num_trans = length (unique (transect_id)))
+uvc_sites$area_sampling <- uvc_sites$area_uvc * uvc_sites$num_trans
+uvc_sites <- uvc_sites[order(uvc_sites$area_sampling, decreasing = F), ]
+min (uvc_sites$area_sampling)
+
+# 3. Estimating fish density and biomass per species ------------------------------
+# Biomass estimation (g/m2)
+db$weigth <- (db$abun * (db$constant_a * ((db$size_cm*db$tl_correction_multiply)
+                                                        ^ db$allometric_coefficient_b)))
+db$biomass_gm2 <- db$weigth/db$area
+
+# Density estimation (ind/m2)
+db$dens_m2     <- db$abun/db$area 
+
+# 4. Bootstrapping, and transect selection  ---------------------------------------
+## SAC Functions 
+source("Code/SAC_functions.R")
+source("Code/Packages.R")
+
+Dat_fish <- db
+names(Dat_fish)[2] <- "cell_id" # Change location name 
+samples <- Dat_fish[,c("transect_id","genus_species","abund","cell_id")]
+summary(samples)
+names(samples)
+names(samples) <- c("haulid","species","abundance","cell_id")
+
+## 4.1. Create objects and fit SAC models ----- 
+cells <- sort(unique(samples$cell_id))
+cells_sub <- cells[]
+
+model=c('gleason','gitay','arrhenius','michaelis-menten')
+yprim=vector()
+
+identity=vector()
+nb.hauls=vector()
+nb.hauls.min=vector()
+keep=vector()
+sr=vector()
+chao=vector()
+
+# Intervals 
+limit0.8 <- limit0.75 <- limit0.65 <- vector()
+asympt <- vector()
+
+sac2 <- list()
+model92 <- list()
+x2 <- list()
+y3 <- list()
+
+
+for(i in 1:length(cells)){
+  
+  print(i)
+  
+  sub.surv <- subset(samples, samples$cell_id %in% cells[i])   
+  
+  tryCatch({
+    
+    #samples <- as.data.frame(aggregate(sub.surv$HLNoAtLngt, by=list(sub.surv$Species,sub.surv$HaulID), FUN=sum))
+    #names(samples) <- c('species','haulID','abundance')
+    
+    # Transform into a matrix for SAC function
+    sample.mat <- dcast(sub.surv, haulid~species, sum, value.var='abundance')
+    rownames(sample.mat) <- sample.mat[,1]
+    sample.mat[,1] <- NULL
+    sample.mat[is.na(sample.mat)] <- 0
+    
+    # Get the unobserved total number of species
+    unobs <- specpool(sample.mat)
+    # Arrondir les cpue
+    sample.mat <- round(sample.mat)
+    sac <- specaccum(sample.mat, method = "random", permutations=10)
+    sac2[i] <- list(sac)
+    
+    #rare <- specaccum(sample.mat, method='rarefaction', xvar='individuals')
+    model9 <- fitspecaccum(sac, model='michaelis-menten', method='random')
+    model92[i] <- list(model9)
+    
+    #model9r <- fitspecaccum(rare, model='michaelis-menten')
+    fitted9 <- fitted(model9)
+    aic9 <- sapply(model9$models, AIC)
+    num9 <- which(aic9==min(aic9))
+    result9 <- fitted9[,num9]
+    means9 <- apply(fitted9, 1, FUN=mean)
+    w <- coef(model9)
+    v <- apply(w, 1, FUN=mean)
+    x <- seq(from=1, to=nrow(fitted9), by=1)
+    x2[i] <- list(x)
+    
+    
+    ### Get fit function
+    y <- curves(v[1], v[2], x, model[u])
+    y3[i] <- list(y)
+    
+    ### Get first derivative at max nhauls
+    y2 <- first.der(v[1],v[2],x, model[u])
+    
+    plot(sac, xlab='', ylab='')
+    plot(model9, add=TRUE, col='grey')
+    plot(sac, xlab='', ylab='', add=TRUE)
+    points(y~x, type='l', lwd=5, col='orange')
+    
+    ### Get all values
+    if(length(y2)>0){
+      yprim[length(yprim)+1] <- y2[length(y2)]
+      identity[length(identity)+1] <- as.character(cells[i])
+      nb.hauls[length(nb.hauls)+1] <- nrow(sample.mat)
+      chao[length(chao)+1] <- round(unobs$chao)
+      sr[length(sr)+1] <- unobs$Species
+      asympt[length(asympt)+1] <- v[1]
+      
+      ### Get nb of hauls necessary to reach % of chao 
+      limit <- 0.8*round(v[1])
+      obj <- which(y>limit)
+      
+      if(length(obj)>0){limit0.8[length(limit0.8)+1] <- obj[1]}
+      else{limit0.8[length(limit0.8)+1] <- NA}
+      
+      limit <- 0.75*round(v[1])
+      obj <- which(y>limit)
+      
+      if(length(obj)>0){limit0.75[length(limit0.75)+1] <- obj[1]}
+      else{limit0.75[length(limit0.75)+1] <- NA}
+      
+      limit <- 0.65*round(v[1])
+      obj <- which(y>limit)
+      
+      if(length(obj)>0){limit0.65[length(limit0.65)+1] <- obj[1]}
+      else{limit0.65[length(limit0.65)+1] <- NA}
+      
+      #Keep or not if y'<0.65 meaning decreasing trend
+      x2 <- seq(from=1, to=100, by=1)
+      y0 <- curves(v[1], v[2], x2, model[u])
+      yprim2 <- first.der(v[1],v[2],x2, model[u])
+      lets <- which(yprim2<0.65)
+      if(length(lets)>0){
+        if(lets[1] <= length(x)){keep[length(keep)+1] <- 'YES'}
+        if(lets[1] > length(x)){keep[length(keep)+1] <- 'NO'}
+        
+        #Min number of hauls necessary
+        nb.hauls.min[length(nb.hauls.min)+1]  <-lets[1]                          
+        
+      }
+      
+    }
+    
+    if(length(lets)==0){keep[length(keep)+1] <- 'NO'
+    nb.hauls.min[length(nb.hauls.min)+1] <- NA}
+    rm(y2,sample.mat)
+    
+  },error=function(e){cat("ERROR :",conditionMessage(e), "\n")})                    
+  
+}
+mat.deriv <- as.data.frame(cbind(identity, yprim, nb.hauls,nb.hauls.min, keep,sr,chao,limit0.8, limit0.75, limit0.65, asympt))
+mat.deriv$yprim <- as.numeric(as.vector(mat.deriv$yprim))
+mat.deriv$nb.hauls <- as.numeric(as.vector(mat.deriv$nb.hauls))
+mat.deriv$nb.hauls.min <- as.numeric(as.vector(mat.deriv$nb.hauls.min))
+mat.deriv$limit0.75 <- as.numeric(as.vector(mat.deriv$limit0.75))
+mat.deriv$limit0.65 <- as.numeric(as.vector(mat.deriv$limit0.65))
+
+colnames(mat.deriv)[1] <- "cell"
+
+mat.deriv65 <- mat.deriv[!is.na(mat.deriv$limit0.65),]
+mat.deriv65$limit0.65 <- as.character(as.numeric(mat.deriv65$limit0.65))
+mat.deriv65 <- mat.deriv65[!duplicated(mat.deriv65[c("cell")]),]
+
+test <- sac2
+test2 <- model92
+allcurves <- list()
+
+for(m in seq_along(test)){
+  
+  df <- data.frame(sites = test[[m]]$sites)
+  df$richness <- test[[m]]$richness
+  df$sd <- test[[m]]$sd
+  df$id <- rep(m, nrow(df))
+  allcurves[m] <- list(df)
+  
+  print(m)
+}
+
+allmodels <- list()
+for(n in seq_along(test2)){
+  
+  df2 <- data.frame(sites = test2[[n]]$sites)
+  df2$richness <- test2[[n]]$richness
+  df2$sd <- test2[[n]]$sd
+  df2$id <- rep(n, nrow(df2))
+  allmodels[n] <- list(df2)
+  
+  print(n)
+} 
+
+b <- bind_rows(allcurves)
+b$sac <- "sac"
+c <- bind_rows(allmodels)
+
+c$sac <- "model"
+d <- rbind(b,c)
+
+d$id <- as.factor(d$id)
+levels(d$id) <- cells
+
+# First we make a vector with the number of hauls needed for each grid cell to reach 65% of asymptotic species richness
+nb.hauls.min <- mat.deriv$limit0.65
+nb.hauls.min1 <- nb.hauls.min
+
+# Unique cells
+cells <- sort(unique(Dat_fish$cell_id))
+names(nb.hauls.min1) <- cells
+
+# Empty vector to store first loop results
+testlist <- vector(mode="list")
+
+# For loop randomly selecting X number of transects 99 times for each grid cell
+for(i in 1:length(cells)){
+  print(i)
+  sub.surv <- droplevels(subset(Dat_fish, Dat_fish$cell_id %in% cells[i]))
+  length(unique(sub.surv$transect_id))
+  
+  y <- replicate(100,sample(unique(sub.surv$transect_id), nb.hauls.min[i], replace=F))
+  as.array(y)
+  testlist[[i]] <- y
+  
+}
+
+# converting each list into a dataframe structure
+N <- seq(1:length(unique(Dat_fish$cell_id)))
+cell_names <- data.frame(matrix(ncol = 100, nrow = 0))
+
+for (i in 1:length(N)){
+  print(i)
+  
+  y <- testlist[i]
+  gh <- data.frame(y)
+  
+  cell_names <- data.frame(rbind(cell_names,gh))
+}
+
+
+# 5. Re-scaling factors --------------------------------------------------
+# RESCALE PREDICTORS #
+rescale_variables <- function (x) {(x - mean(x))/(1*sd (x))}
+
+# Protection levels according to Colombia's National Registry of Protected Areas
+coor_loc$plevel_scale <- NA
+coor_loc$plevel_scale <- ifelse (coor_loc$pro_level=="not",1,coor_loc$plevel_scale)
+coor_loc$plevel_scale <- ifelse (coor_loc$pro_level=="drmi_ctcc",2,coor_loc$plevel_scale)
+coor_loc$plevel_scale <- ifelse (coor_loc$pro_level=="pnn",3,coor_loc$plevel_scale)
+coor_loc$plevel_scale <- rescale_variables(coor_loc$plevel_scale)
+
+# Human factors (number of fishermen and market distance)
+coor_loc$total_fisherman <- as.numeric (coor_loc$total_fisherman) 
+coor_loc$nfisherman_scale <- rescale_variables(log(coor_loc$total_fisherman + 1))
+
+coor_loc$distance_market_km <- as.numeric(coor_loc$distance_market_km)
+coor_loc$Dmarket_scale    <- rescale_variables(log(coor_loc$distance_market_km+1))
+
+coor_loc$age_scale <- rescale_variables(log(coor_loc$age+1))
+colnames(coor_loc)[2] <- "cell_id"
+
+# Testing correlation among human and conservation factors
+cor_matrix <- cor (coor_loc[,15:18], method = "pearson")
+
+human_factors <- coor_loc [,c("locality","cell_id","plevel_scale",
+                              "nfisherman_scale","Dmarket_scale",
+                              "age_scale")]
+
+# 6 Fish metrics and models -----------------------------------------------
+values_summary_sites  <- list ()
+values_summary_trans  <- list()
+values_summary_family <- list()
+values_summary_tropgr <- list ()
+values_density_simper <- list ()
+values_biomass_simper <- list ()
+msric_results <- list ()
+mdens_results <- list ()
+mbiom_results <- list ()
+notMalpelo_mSRic <- list ()
+notMalpelo_mDens <- list ()
+notMalpelo_mBiom <- list ()
+
+for (j in 1:100){
+  print(j)
+  
+  g <- droplevels (Dat_fish[Dat_fish$transect_id %in% cell_names[,j], ])
+  
+  
+  # Metric by transect
+  summary_metrics_trans <- ddply(g,. (locality, cell_id, transect_id, year),
+                                 summarise, 
+                      sumRich = length(unique(genus_species)),
+                      sumDensity = sum (dens_m2),
+                      sumBiomass = sum(biomass_gm2))
+  values_summary_trans [[j]] <- summary_metrics_trans
+  
+  # Total metrics per site scale
+  mean_summary_site <- ddply (summary_metrics_trans,. (locality, cell_id),
+                              summarise, 
+                              mean_srich=mean(sumRich),
+                              sd_srich=sd(sumRich),
+                              se_srich=sd(sumRich)/sqrt(length(unique(transect_id))),
+                              mean_density=mean(sumDensity),
+                              sd_density=sd (sumDensity),
+                              se_density=sd(sumDensity)/sqrt(length(unique(transect_id))),
+                              mean_biomass=mean(sumBiomass),
+                              sd_biomass=sd(sumBiomass),
+                              se_biomass=sd(sumBiomass)/sqrt(length(unique(transect_id))))
+  values_summary_sites [[j]] <- mean_summary_site
+  
+  # Metrics per trophic groups and transect
+  values_tgroups <- ddply (g,. (locality,cell_id,transect_id,diet_gaspar),
+                           summarize, 
+                           richness = length(unique(genus_species)),
+                           dens_m2 = sum(dens_m2),
+                           biomass_gm2 = sum(biomass_gm2))
+  
+  values_summary_tropgr[[j]] <- values_tgroups
+  
+  # Metrics per family and location
+  mean_values_family <- ddply (g,. (locality,transect_id,family), summarize, 
+                               richness = length(unique(genus_species)),
+                               dens_m2 = sum(dens_m2),
+                               biomass_gm2 = sum(biomass_gm2)) 
+  values_summary_family [[j]] <- mean_values_family
+  
+
+  # SIMPER - considering the density 
+  species_list_matrix <- dcast (locality+cell_id~genus_species,
+                                value.var = "dens_m2",
+                                fun.aggregate = sum,
+                                data=g)
+  
+  location_inf <- species_list_matrix [,1:2]
+  
+  species_list_matrix <- species_list_matrix[,3:length(species_list_matrix)]
+  
+  
+  simper_spp_contribution <- with (location_inf,
+                                   simper (comm = species_list_matrix, 
+                                           group = locality, 
+                                           permutations = 999))
+  
+  output <- summary(simper_spp_contribution, ordered = TRUE)
+  
+  simper_contribution_70 <- list ()
+  
+  for(l in seq_along(output)) {
+    sppimp <- output[[l]]
+    sppimp <- sppimp[which(sppimp$cumsum <= 0.75), ]
+    sppimp$location <- rep(names(output[l]), nrow(sppimp))
+    sppimp$species <- rownames(sppimp)
+    row.names(sppimp) <- NULL
+    simper_contribution_70[[l]] <- sppimp
+  }
+  
+  simper_contribution_70d <- do.call ("rbind", simper_contribution_70)
+  values_density_simper [[j]] <- simper_contribution_70d
+
+  # SIMPER - considering biomass
+  species_list_matrix <- dcast (locality+cell_id~genus_species,
+                                value.var = "biomass_gm2",
+                                fun.aggregate = sum,
+                                data=g)
+  
+  location_inf <- species_list_matrix [,1:2]
+  
+  species_list_matrix <- species_list_matrix[,3:length(species_list_matrix)]
+  
+  
+  simper_spp_contribution <- with (location_inf,
+                                   simper (comm = species_list_matrix, 
+                                           group = locality, 
+                                           permutations = 999))
+  
+  output <- summary(simper_spp_contribution, ordered = TRUE)
+  
+  simper_contribution_70 <- list ()
+  
+  for(l in seq_along(output)) {
+    sppimp <- output[[l]]
+    sppimp <- sppimp[which(sppimp$cumsum <= 0.75), ]
+    sppimp$location <- rep(names(output[l]), nrow(sppimp))
+    sppimp$species <- rownames(sppimp)
+    row.names(sppimp) <- NULL
+    simper_contribution_70[[l]] <- sppimp
+  }
+  
+  simper_contribution_70b <- do.call ("rbind", simper_contribution_70)
+  values_biomass_simper [[j]] <- simper_contribution_70b
+  
+  
+
+  # General Linear Mixed models 
+  db_models <- left_join(summary_metrics_trans,human_factors)
+  db_models <- na.omit(db_models)
+  
+  # Species richness model
+  mSRic <- glmer (sumRich~plevel_scale+
+                    nfisherman_scale+
+                    Dmarket_scale+
+                    (1|year:locality), 
+                  family = poisson(link = "log"), 
+                  data = db_models)
+  results_selection_model_mSRic <- dredge (mSRic)
+  avg_OLS_mSRic <- model.avg (results_selection_model_mSRic) 
+  summary (avg_OLS_mSRic) 
+  
+  mSRic <- data.frame (drop1(mSRic, test="Chisq"))
+  mSRic <- mSRic[-1, ]
+  
+  msric_results[[j]] <- mSRic
+  
+  # Density model
+  mDens <-  glmer (sumDensity~plevel_scale+
+                    nfisherman_scale+
+                     Dmarket_scale+
+                     (1|year:locality),
+                    family = Gamma,
+                    data = db_models)
+  results_selection_model_mDens <- dredge (mDens)
+  avg_OLS_mDens <- model.avg (results_selection_model_mDens) 
+  summary (avg_OLS_mDens) 
+  
+  mDens <- data.frame (drop1(mDens, test="Chisq"))
+  mDens <- mDens[-1, ]
+  
+  mdens_results[[j]] <- mDens
+  
+  # Biomass model
+  mBiomass <-  glmer (log(sumBiomass+1)~plevel_scale+
+                        nfisherman_scale+
+                        Dmarket_scale+
+                        #age_scale+
+                     (1|year:locality),
+                     family = Gamma,
+                     data = db_models)
+  results_selection_model_mBiomass <- dredge (mBiomass)
+  avg_OLS_mBiomass <- model.avg (results_selection_model_mBiomass) 
+  summary (avg_OLS_mBiomass) 
+  
+  mBiomass <- data.frame (drop1(mBiomass, test="Chisq"))
+  mBiomass <- mBiomass[-1, ]
+  
+  mbiom_results[[j]] <- mBiomass
+  
+  #MODELS EXCLUDING MALPELO
+  # SRICHNESS
+  exc_malp_db_models <- droplevels (db_models[!db_models$locality=="malpelo",])
+  
+  no_malp_mSRic <- glmer (sumRich ~plevel_scale+
+                           nfisherman_scale+
+                          Dmarket_scale+
+                          (1|year:locality), 
+                          family = poisson(link = "log"), 
+                          data = exc_malp_db_models)
+  
+  results_selection_model_no_malp_mSRic <- dredge (no_malp_mSRic)
+  avg_OLS_no_malp_mSRic <- model.avg (results_selection_model_no_malp_mSRic) 
+  summary (avg_OLS_no_malp_mSRic) 
+  
+  no_malp_mSRic <- data.frame (drop1(no_malp_mSRic, test="Chisq"))
+  no_malp_mSRic <- no_malp_mSRic[-1, ]
+  
+
+  notMalpelo_mSRic[[j]] <- no_malp_mSRic
+  
+  # MDensity
+  no_malp_mDens <- glmer (sumDensity~plevel_scale+
+                            nfisherman_scale+
+                            Dmarket_scale+
+                          #age_scale+
+                          (1|year:locality), 
+                          family = Gamma, 
+                          data = exc_malp_db_models)
+  
+  results_selection_model_no_malp_mDens <- dredge (no_malp_mDens)
+  avg_OLS_no_malp_mDens <- model.avg (results_selection_model_no_malp_mDens) 
+  summary (avg_OLS_no_malp_mDens) 
+  
+  no_malp_mDens <- data.frame (drop1(no_malp_mDens, test="Chisq"))
+  no_malp_mDens <- no_malp_mDens[-1, ]
+  
+  notMalpelo_mDens [[j]] <- no_malp_mDens
+  
+  # MBiomass
+  no_malp_mBiomass <- glmer (log(sumBiomass+1)~plevel_scale+
+                              nfisherman_scale+
+                              Dmarket_scale+
+                              #age_scale+
+                            (1|year:locality), 
+                             family = Gamma, 
+                          data = exc_malp_db_models)
+  
+  results_selection_model_no_malp_mBiomass <- dredge (no_malp_mBiomass)
+  avg_OLS_no_malp_mBiomass <- model.avg (results_selection_model_no_malp_mBiomass) 
+  summary (avg_OLS_no_malp_mBiomass) 
+  
+  no_malp_mBiomass <- data.frame (drop1(no_malp_mBiomass, test="Chisq"))
+  no_malp_mBiomass <- no_malp_mBiomass[-1, ]
+  
+  notMalpelo_mBiom [[j]] <- no_malp_mBiomass
+  
+  
+  }
+
+
+# Results species richness models
+for (i in 1:length(msric_results)){
+  
+  msric_results[[i]]$factor <- rownames(msric_results[[i]]) 
+  rownames(msric_results[[i]]) <- NULL
+  
+}
+full_msric_results <- do.call ('rbind', msric_results)
+full_msric_results <- ddply (full_msric_results,.
+                             (factor), summarise, 
+                             AIC = mean(AIC),
+                             LRT = mean (LRT),
+                             Pr.Chi = mean (Pr.Chi.))
+
+# Results density models
+for (i in 1:length(mdens_results)){
+  mdens_results[[i]]$factor <- rownames(mdens_results[[i]])
+  rownames(mdens_results[[i]]) <- NULL
+}
+full_mdens_results <- do.call ('rbind', mdens_results)
+full_mdens_results <- ddply (full_mdens_results,. 
+                             (factor), summarise,
+                             AIC = mean(AIC),
+                             LRT = mean (LRT),
+                             Pr.Chi = mean (Pr.Chi.))
+
+# Results Biomass models
+for (i in 1:length(mbiom_results)){
+  mbiom_results[[i]]$factor <- rownames(mbiom_results[[i]])
+  rownames(mbiom_results[[i]]) <- NULL
+}
+full_mbiom_results <- do.call ('rbind', mbiom_results)
+full_mbiom_results <- ddply (full_mbiom_results,. 
+                             (factor), summarise, 
+                             AIC = mean(AIC),
+                             LRT = mean (LRT),
+                             Pr.Chi = mean (Pr.Chi.))
+
+# Results excluding Malpelo
+
+for (i in 1:length(notMalpelo_mSRic)){
+  
+  notMalpelo_mSRic[[i]]$factor <- rownames(notMalpelo_mSRic[[i]]) 
+  rownames(notMalpelo_mSRic[[i]]) <- NULL
+  
+}
+full_notMalpelo_mSRic <- do.call ('rbind', notMalpelo_mSRic)
+full_notMalpelo_mSRic <- ddply (full_notMalpelo_mSRic,.
+                             (factor), summarise, 
+                             AIC = mean(AIC),
+                             LRT = mean (LRT),
+                             Pr.Chi = mean (Pr.Chi.))
+
+# Results density models
+for (i in 1:length(notMalpelo_mDens)){
+  notMalpelo_mDens[[i]]$factor <- rownames(notMalpelo_mDens[[i]])
+  rownames(notMalpelo_mDens[[i]]) <- NULL
+}
+full_notMalpelo_mDens <- do.call ('rbind', notMalpelo_mDens)
+full_notMalpelo_mDens <- ddply (full_notMalpelo_mDens,. 
+                             (factor), summarise,
+                             AIC = mean(AIC),
+                             LRT = mean (LRT),
+                             Pr.Chi = mean (Pr.Chi.))
+
+# Results Biomass models
+for (i in 1:length(notMalpelo_mBiom)){
+  notMalpelo_mBiom[[i]]$factor <- rownames(notMalpelo_mBiom[[i]])
+  rownames(notMalpelo_mBiom[[i]]) <- NULL
+}
+full_notMalpelo_mBiom <- do.call ('rbind', notMalpelo_mBiom)
+full_notMalpelo_mBiom <- ddply (full_notMalpelo_mBiom,. 
+                             (factor), summarise, 
+                             AIC = mean(AIC),
+                             LRT = mean (LRT),
+                             Pr.Chi = mean (Pr.Chi.))
+
+
+## 6.1. SIMPER Results --------------------------------------------------
+# Density
+values_density_simper1 <- do.call("rbind",values_density_simper)
+values_density_simper1 <- ddply(values_density_simper1,. (location,species),
+                               summarise, 
+                               Global_mean=mean (average),
+                               SD=mean (sd),
+                               ratio=mean(ratio),
+                               Density_CumSum=mean(cumsum),
+                               p=mean(p))
+values_density_simper1 <- droplevels (subset (values_density_simper1, p<0.05))
+values_density_simper1 <- droplevels (subset (values_density_simper1, Density_CumSum<=0.70))
+values_density_simper1 <- values_density_simper1[order(values_density_simper1$location, decreasing = F), ]
+
+values_density_simper1$species <- gsub("_"," ",values_density_simper1$species)
+values_density_simper1$location <- gsub ("_", " ", values_density_simper1$location)
+
+values_density_simper1$species <- str_to_sentence(values_density_simper1$species)
+values_density_simper1$location <- str_to_title(values_density_simper1$location)
+
+
+# Biomass
+values_biomass_simper1 <- do.call ("rbind", values_biomass_simper)
+values_biomass_simper1 <- ddply (values_biomass_simper1,. (location,species),
+                                summarise,
+                                Global_mean=mean (average),
+                                SD=mean (sd),
+                                ratio=mean(ratio),
+                                CumSum=mean(cumsum),
+                                p=mean(p))
+values_biomass_simper1 <- droplevels (subset(values_biomass_simper1, p<0.05))
+values_biomass_simper1 <- droplevels (subset(values_biomass_simper1, CumSum<=0.70))
+values_biomass_simper1 <- values_biomass_simper1[order(values_biomass_simper1$location, decreasing = F), ]
+
+values_biomass_simper1$species <- gsub("_"," ",values_biomass_simper1$species)
+values_biomass_simper1$location <- gsub ("_", " ", values_biomass_simper1$location)
+
+values_biomass_simper1$species <- str_to_sentence(values_biomass_simper1$species)
+values_biomass_simper1$location <- str_to_title(values_biomass_simper1$location)
+
+values_biomass_simper1$location <- gsub("Golfo Tribuga", "Golfo de Tribugá", values_biomass_simper1$location)
+
+
+
+## 6.2 Accumulation curves -----------------------------------------------------
+spp_trans <- cast (transect_id ~ genus_species, value="abund",
+                   fun.aggregate = sum, 
+                   data = db) 
+rownames (spp_trans) <- spp_trans$transect_id
+spp_trans <- spp_trans[,-1]
+
+# Matrix with spatial information
+db$trans <- 1
+trans_iden <- ddply (db,. (locality,transect_id), summarise, total_lines=max(trans))
+trans_iden <- trans_iden[,1:2]
+
+# Accumulation curves
+accuml_spp <- accumcomp(spp_trans, y=trans_iden, factor = "locality",
+                        method = "exact", conditioned = F, plotit = F)
+accum.long <- accumcomp.long(accuml_spp, ci=NA, label.freq=5)
+
+# Figure 1a 
+Fig1a <- ggplot(data=accum.long, aes(x = Sites, y = Richness, ymax = UPR, ymin = LWR)) + 
+  scale_x_continuous(expand=c(0, 1), sec.axis = dup_axis(labels=NULL, name=NULL)) +
+  scale_y_continuous(sec.axis = dup_axis(labels=NULL, name=NULL)) +
+  geom_line(aes(colour=Grouping), size=1.3)+
+  geom_vline(xintercept = 30, linetype="dotted", color="red", size=0.7)+
+  geom_ribbon(aes(colour=Grouping), alpha=0.2, show.legend=F) +
+  labs(y="Species richness", x="Number of transects", color="Location")+
+  theme_bw()
+
+# Total values estimated from bootstrap according to spatial scale (i.e., Location, Site or Transect) 
+total_values <- do.call(rbind.data.frame, values_summary_sites)
+
+total_values_loc <- ddply (total_values,. (locality), summarise,
+                           mean_richness=mean(mean_srich),
+                           sd_richness=mean(sd_srich),
+                           se_richness=mean(se_srich),
+                           mean_density=mean(mean_density),
+                           sd_density=mean(sd_density),
+                           se_density=mean(se_density),
+                           mean_biomass=mean(mean_biomass),
+                           sd_biomass=mean(sd_biomass),
+                           se_biomass=mean(se_biomass))
+
+total_values_sites <- ddply (total_values,. (locality, cell_id), summarise,
+                             mean_richness=mean(mean_srich),
+                             sd_richness=mean(sd_srich),
+                             se_richness=mean(se_srich),
+                             mean_density=mean(mean_density),
+                             sd_density=mean(sd_density),
+                             se_density=mean(se_density),
+                             mean_biomass=mean(mean_biomass),
+                             sd_biomass=mean(sd_biomass),
+                             se_biomass=mean(se_biomass))
+
+
+
+## 6.3 Fish metrics per families ---------------------------------------------
+
+total_values_families <- do.call(rbind.data.frame, values_summary_family)
+total_values_families <- ddply (total_values_families,. (locality,family), summarise, 
+                                mean_richness=round(mean(richness),3), 
+                                sd_richness=round(sd(richness),3),
+                                mean_density=round(mean(dens_m2),3), 
+                                sd_density=round(sd(dens_m2),3),
+                                mean_biomass=round(mean(biomass_gm2),3), 
+                                sd_biomass=round(sd(biomass_gm2),3))
+total_values_families <- droplevels (subset(total_values_families, sd_richness>0))
+total_values_families$family <- ifelse(total_values_families$family=="labridae_scarini","scarinidae",total_values_families$family)
+total_values_families$family <- paste(toupper(substring(total_values_families$family, 1, 1)), 
+                                      substring(total_values_families$family, 2), sep = "")
+
+ 
+average_richness_family <- summarySE(total_values_families,
+                                 measurevar = "mean_richness",
+                                 groupvars = "family")
+average_richness_family[is.na(average_richness_family)]<-0
+
+Fig2a <- ggplot (average_richness_family, 
+                  aes(x=mean_richness,
+                      y=family))+
+  geom_point(pch=18, cex=2.5)+
+  geom_errorbar(aes(xmin=mean_richness-se, 
+                    xmax=mean_richness+se), 
+                width=.2,
+                position=position_dodge(0.05))+
+  scale_y_discrete(limits=rev)+
+  scale_x_discrete(position = "top")+
+  scale_x_continuous(position = "top")+
+  labs(x="Mean fish richness")+
+  theme_bw()+
+  theme (axis.title.y = element_blank())
+
+average_density_family <- summarySE(total_values_families,
+                                 measurevar = "mean_density",
+                                 groupvars = "family")
+average_density_family[is.na(average_density_family)]<-0
+
+
+Fig2b <- ggplot (average_density_family, aes(x=mean_density,y=family))+
+  geom_point(pch=18, cex=2.5)+
+  geom_errorbar(aes(xmin=mean_density-se, 
+                    xmax=mean_density+se), 
+                width=.2,
+                position=position_dodge(0.05))+
+  labs(x=expression(paste("Mean fish density (ind/"~m^2,")")))+
+  scale_y_discrete(limits=rev)+
+  scale_x_discrete(position = "top")+
+  scale_x_continuous(position = "top")+
+  theme_bw()+
+  theme (axis.title.y = element_blank(),
+         axis.text.y = element_blank())
+
+average_biomass_family <- summarySE(total_values_families,
+                                measurevar = "mean_biomass",
+                                groupvars = "family")
+average_biomass_family[is.na(average_biomass_family)]<-0
+
+Fig2c <- ggplot (average_biomass_family, aes(x=mean_biomass,y=family))+
+  geom_point(pch=18, cex=2.5)+
+  geom_errorbar(aes(xmin=mean_biomass-se, 
+                    xmax=mean_biomass+se), 
+                width=.2,
+                position=position_dodge(0.05))+
+  labs(x=expression(paste("Mean fish biomass (ind/"~m^2,")")))+
+  scale_y_discrete(limits=rev)+
+  scale_x_discrete(position = "top")+
+  scale_x_continuous(position = "top")+
+  theme_bw()+
+  theme (axis.title.y = element_blank(),
+         axis.text.y = element_blank())
+
+## 6.4. Fish metrics per trophic group -----------------------------------------------
+# Boxplot species richness, density and biomass per trophic group
+total_values_tg <- do.call(rbind.data.frame, values_summary_tropgr)
+
+total_values_tg_site <- ddply (total_values_tg,. (locality,cell_id,diet_gaspar), 
+                               summarise,
+                               mean_richness=mean(richness),
+                               mean_density=mean(dens_m2),
+                               mean_biomass=mean(biomass_gm2))
+
+ 
+Fig_2_boxplot_a <- ggplot(total_values_tg_site, 
+                          aes(x=factor(diet_gaspar, 
+                                       levels=c("hd","hm","is","im","om","pk","fc")), 
+                              y=mean_richness))+
+  geom_boxplot(fill="grey90", color="black")+
+  labs(x="Trophic group", y=expression(paste("Mean fish richness")))+
+  scale_x_discrete(breaks=c("fc","hd","hm","im","is","om","pk"),
+                   labels=c("PS","HD","HM","IM","IS","OM","PK"))+
+  coord_flip()+
+  theme_bw()+
+  theme(axis.title.x = element_blank())
+
+summarySE(total_values_tg_site,
+          measurevar = "mean_biomass",
+          groupvars = "diet_gaspar")
+
+Fig_2_boxplot_b <- ggplot(droplevels(subset(total_values_tg_site, mean_density<=5)), 
+                          aes(x=factor(diet_gaspar, 
+                                       levels=c("hd","hm","is","im","om","pk","fc")), 
+                              y=mean_density))+
+  geom_boxplot(fill="grey90", color="black")+
+  labs(x="Trophic group", y=expression(paste("Mean fish density (ind/"~m^2,")")))+
+  scale_x_discrete(breaks=c("fc","hd","hm","im","is","om","pk"),
+                   labels=c("PS","HD","HM","IM","IS","OM","PK"))+
+  coord_flip()+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank())
+
+
+Fig_2_boxplot_c <- ggplot(total_values_tg_site,
+                          aes(x=factor(diet_gaspar, 
+                                       levels=c("hd","hm","is","im","om","pk","fc")), 
+                              y=log(mean_biomass+1)))+
+  geom_boxplot(fill="grey90", color="black")+
+  labs(x="Trophic group", y=expression(paste("Mean fish biomass (g/"~m^2,")")))+
+  scale_x_discrete(breaks=c("fc","hd","hm","im","is","om","pk"),
+                   labels=c("PS","HD","HM","IM","IS","OM","PK"))+
+  coord_flip()+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank())
+
+
+
+ggarrange(Fig2a, Fig2b, Fig2c, 
+          Fig_2_boxplot_a, Fig_2_boxplot_b, Fig_2_boxplot_c,
+          ncol = 3,
+          nrow = 2, 
+          align="hv", 
+          widths = 1,
+          heights = 1)
+
+
+## 6.5 Species richness per trophic group --------
+total_values_tg_loc <- ddply (total_values_tg,. (locality,diet_gaspar), 
+                              summarise,
+                              mean_richness=mean(richness),
+                              mean_density=mean(dens_m2),
+                              mean_biomass=mean(biomass_gm2))
+
+richness_tg <- cast (locality~diet_gaspar, value = "mean_richness",
+                     data=total_values_tg_loc, fun.aggregate = sum)
+rownames (richness_tg) <- richness_tg$locality
+richness_tg <- richness_tg[,-1]
+colnames(richness_tg)  <- c("PS","HD","HM","IM","IS","OM","PK")
+richness_tg <- prop.table(data.matrix(richness_tg), 2)
+
+richness_tg <- rbind (rep(max(richness_tg),7), rep(min(richness_tg),7), richness_tg)
+
+colors_locations <- c("#F8766D","#C59900","#00BC59","#00C1AA","#00B4EF","#BF80FF","#F763E0")
+colors_locations <- alpha(colors_locations, 0.5)
+
+radarchart(as.data.frame(richness_tg),  axistype=1, 
+           #custom polygon
+           plwd=1.3 , plty=1, pcol = colors_locations,
+           #custom the grid
+           cglcol="grey", cglty=1, axislabcol="grey", 
+           caxislabels=seq(round(min(richness_tg),2),0.21,0.03), 
+           cglwd=0.4,
+           #custom labels
+           vlcex=1)
+
+## 6.6 Density per trophic group --------
+density_tg <- cast (locality~diet_gaspar, value = "mean_density",
+                     data=total_values_tg_loc, fun.aggregate = sum)
+rownames (density_tg) <- density_tg$locality
+density_tg <- density_tg[,-1]
+colnames(density_tg)  <- c("PS","HD","HM","IM","IS","OM","PK")
+density_tg <- prop.table(data.matrix(density_tg), 2)
+
+density_tg <- rbind (rep(max(density_tg),7), rep(min(density_tg),7), density_tg)
+(max(density_tg) - min(density_tg))/5
+
+radarchart(as.data.frame(density_tg),  axistype=1, 
+                    #custom polygon
+                    plwd=1.2 , plty=1, pcol = colors_locations,
+                    #custom the grid
+                    cglcol="grey", cglty=1, axislabcol="grey", 
+                    caxislabels=seq(round(min(density_tg),2),0.43,0.09), 
+                    cglwd=0.4,
+                    #custom labels
+                    vlcex=1)
+
+## 6.7 Biomass per trophic group --------
+biomass_tg <- cast (locality~diet_gaspar, value = "mean_biomass",
+                    data=total_values_tg_loc, fun.aggregate = sum)
+rownames (biomass_tg) <- biomass_tg$locality
+biomass_tg <- biomass_tg[,-1]
+colnames(biomass_tg)  <- c("PS","HD","HM","IM","IS","OM","PK")
+biomass_tg <- prop.table(data.matrix(biomass_tg), 2)
+
+biomass_tg <- rbind (rep(max(biomass_tg),7), rep(min(biomass_tg),7), biomass_tg)
+(max(biomass_tg) - min(biomass_tg))/5
+
+radarchart(as.data.frame(biomass_tg),  axistype=1, 
+                    #custom polygon
+                    plwd=1.2 , plty=1, pcol = colors_locations,
+                    #custom the grid
+                    cglcol="grey", cglty=1, axislabcol="grey", 
+                    caxislabels=seq(round(min(biomass_tg),2),0.75,0.18), 
+                    cglwd=0.4,
+                    #custom labels
+                    vlcex=1)
+
+
+# 7. General Linear Models --------------------------------------------------
+# Comparing fish metrics per location
+
+total_values_sites$locality <- as.factor(total_values_sites$locality)
+
+# Density comparison
+density_loc_glm <- glm (mean_density~locality, family = Gamma,
+                        data = total_values_sites) 
+summary (density_loc_glm)
+drop1 (density_loc_glm, test = "F")
+
+summary(glht (density_loc_glm, 
+              linfct=mcp(locality="Tukey", 
+                         interaction_average = F)))
+
+# Biomass comparison
+biomass_loc_glm <- glm (mean_biomass~locality, family = Gamma,
+                        data = total_values_sites) 
+summary (biomass_loc_glm)
+drop1 (biomass_loc_glm, test = "F")
+
+summary(glht (biomass_loc_glm, 
+              linfct=mcp(locality="Tukey", 
+                         interaction_average = F)))
+
+modelsummary(list(density_loc_glm,biomass_loc_glm))
+
+
+#8. PERMANOVA exploring human factors on fish assemblages metrics -----------------------
+if(!require(vegan)){install.packages('vegan'); library(vegan)}
+# Fish species Richness
+total_values_tg_site_richness <- ddply (total_values_tg,. (locality, sites, diet_gaspar),
+                               summarise, richness=round(mean(richness)))
+total_values_tg_site_richness <- cast (locality+sites~diet_gaspar,
+                              value = "richness",
+                              fun.aggregate = sum,
+                              data=total_values_tg_site_richness) 
+
+total_values_tg_site_richness <- left_join(total_values_tg_site_richness, mean_summary_site)
+total_values_tg_site_richness_exclude <- droplevels (total_values_tg_site_richness[!total_values_tg_site_richness$locality=="malpelo",])
+
+permanova_richness <- adonis2 (total_values_tg_site_richness[,3:9]~nfisherman_scale+
+           Dmarket_scale+
+           plevel_scale,
+         data = total_values_tg_site_richness, 
+         permutations = 999, method = "bray")
+
+adonis2 (total_values_tg_site_richness_exclude[,3:9]~nfisherman_scale+
+           Dmarket_scale+
+           plevel_scale,
+         data = total_values_tg_site_richness_exclude, 
+         permutations = 999, method = "bray")
+
+human_factors <- data.frame(total_values_tg_site_richness_exclude[,c("locality","Dmarket_scale","plevel_scale","nfisherman_scale")])
+
+rownames(total_values_tg_site_richness_exclude) <- total_values_tg_site_richness_exclude$sites
+nmds_richness <- metaMDS(data.matrix(total_values_tg_site_richness_exclude[,3:9]), distance="bray")
+humF_richness <- envfit(nmds_richness, human_factors, permutations = 999,na.rm = T)
+
+plot(nmds_richness)
+plot(humF_richness)
+
+scores_richness <- as.data.frame(scores(nmds_richness))
+scores_richness$sites <- total_values_tg_site_richness$sites
+scores_richness$locality <- total_values_tg_site_richness$locality
+
+en_coord_cont_richness <- as.data.frame(scores(humF_richness, "vectors")) * ordiArrowMul(humF_richness)
+rownames(en_coord_cont_richness) <- c("Marke Distance","Protection status","Number fisherman")
+en_coord_cat_richness <- as.data.frame(scores(humF_richness, "factors")) * ordiArrowMul(humF_richness)
+rownames(en_coord_cat_richness) <- c("B. Sol","C. Cor","C. Mar","Cupica","G. Tri","Gorg")
+
+scores_trg <- as.data.frame(nmds_richness$species)
+rownames(scores_trg) <- c("PS","HD","HM","IM","IS","OM","PK")
+
+Fig4A <- ggplot(data = scores_richness, aes(x = NMDS1, y = NMDS2)) + 
+  #geom_point(size = 2, alpha = 0.5, color="navy") + 
+  geom_segment(aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2), 
+               data = en_coord_cont_richness, size =1, alpha = 0.5, colour = "grey30") +
+  geom_segment(aes(x = 0, y = 0, xend = MDS1, yend = MDS2), 
+               data = scores_trg, size =1, alpha = 0.5, colour = "red")+
+  geom_point(data = en_coord_cat_richness, aes(x = NMDS1, y = NMDS2, color=rownames(en_coord_cat_richness)), 
+             shape = "diamond", size = 5, alpha = 0.6) +
+  geom_text(data = en_coord_cont_richness, aes(x = NMDS1, y = NMDS2+0.04), 
+            label = row.names(en_coord_cont_richness), colour = "navy", fontface = "bold")+
+  geom_text(data = en_coord_cat_richness, aes(x = NMDS1, y = NMDS2+0.03), colour = "grey30", 
+            fontface = "bold", label = row.names(en_coord_cat_richness))+
+  geom_text(data = scores_trg, aes(x = MDS1, y = MDS2), colour = "grey30", 
+            fontface = "bold", label = row.names(scores_trg))+
+  theme_bw()+
+  theme(legend.position = "none")
+
+
+# Fish density
+total_values_tg_site_density <- ddply (total_values_tg,. (locality, sites, diet_gaspar),
+                                        summarise, dens_m2=mean(dens_m2))
+total_values_tg_site_density <- cast (locality+sites~diet_gaspar,
+                                       value = "dens_m2",
+                                       fun.aggregate = sum,
+                                       data=total_values_tg_site_density) 
+
+total_values_tg_site_density <- left_join(total_values_tg_site_density, mean_summary_site)
+total_values_tg_site_density_exclude <- droplevels (total_values_tg_site_density[!total_values_tg_site_density$locality=="malpelo",])
+
+permanova_density <- adonis2 (total_values_tg_site_density[,3:9]~nfisherman_scale+
+                                 Dmarket_scale+
+                                 plevel_scale,
+                               data = total_values_tg_site_density, 
+                               permutations = 999, method = "bray")
+
+adonis2 (total_values_tg_site_density_exclude[,3:9]~nfisherman_scale+
+           Dmarket_scale+
+           plevel_scale,
+         data = total_values_tg_site_density_exclude, 
+         permutations = 999, method = "bray")
+
+nmds_density <- metaMDS(data.matrix(total_values_tg_site_density_exclude[,3:9]), distance="bray")
+humF_density <- envfit(nmds_density, human_factors, permutations = 999,na.rm = T)
+
+plot(nmds_density)
+plot(humF_density)
+
+scores_density <- as.data.frame(scores(nmds_density))
+scores_density$sites <- total_values_tg_site_density$sites
+scores_density$locality <- total_values_tg_site_density$locality
+
+en_coord_cont_density <- as.data.frame(scores(humF_density, "vectors")) * ordiArrowMul(humF_density)
+rownames(en_coord_cont_density) <- c("Marke Distance","Protection status","Number fisherman")
+en_coord_cat_density <- as.data.frame(scores(humF_density, "factors")) * ordiArrowMul(humF_density)
+rownames(en_coord_cat_density) <- c("B. Sol","C. Cor","C. Mar","Cupica","G. Tri","Gorg")
+
+scores_trg <- as.data.frame(nmds_density$species)
+rownames(scores_trg) <- c("PS","HD","HM","IM","IS","OM","PK")
+
+Fig4B <- ggplot(data = scores_density, aes(x = NMDS1, y = NMDS2)) + 
+  #geom_point(size = 2, alpha = 0.5, color="navy") + 
+  geom_segment(aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2), 
+               data = en_coord_cont_density, size =1, alpha = 0.5, colour = "grey30") +
+  geom_segment(aes(x = 0, y = 0, xend = MDS1, yend = MDS2), 
+               data = scores_trg, size =1, alpha = 0.5, colour = "red")+
+  geom_point(data = en_coord_cat_density, aes(x = NMDS1, y = NMDS2, color=rownames(en_coord_cat_density)), 
+             shape = "diamond", size = 5, alpha = 0.6) +
+  geom_text(data = en_coord_cont_density, aes(x = NMDS1, y = NMDS2+0.04), 
+            label = row.names(en_coord_cont_density), colour = "navy", fontface = "bold")+
+  geom_text(data = en_coord_cat_density, aes(x = NMDS1, y = NMDS2+0.03), colour = "grey30", 
+            fontface = "bold", label = row.names(en_coord_cat_density))+
+  geom_text(data = scores_trg, aes(x = MDS1, y = MDS2), colour = "grey30", 
+            fontface = "bold", label = row.names(scores_trg))+
+  theme_bw()+
+  theme(legend.position = "none")
+
+
+# Fish Biomass
+total_values_tg_site_biomass <- ddply (total_values_tg,. (locality, sites, diet_gaspar),
+                                       summarise, biomass_gm2=mean(biomass_gm2))
+total_values_tg_site_biomass <- cast (locality+sites~diet_gaspar,
+                                      value = "biomass_gm2",
+                                      fun.aggregate = sum,
+                                      data=total_values_tg_site_biomass) 
+
+total_values_tg_site_biomass <- left_join(total_values_tg_site_biomass, mean_summary_site)
+total_values_tg_site_biomass_exclude <- droplevels (total_values_tg_site_biomass[!total_values_tg_site_biomass$locality=="malpelo",])
+
+permanova_biomass <- adonis2 (total_values_tg_site_biomass[,3:9]~nfisherman_scale+
+                                Dmarket_scale+
+                                plevel_scale,
+                              data = total_values_tg_site_biomass, 
+                              permutations = 999, method = "bray")
+permanova_biomass
+adonis2 (total_values_tg_site_biomass_exclude[,3:9]~nfisherman_scale+
+           Dmarket_scale+
+           plevel_scale,
+         data = total_values_tg_site_biomass_exclude, 
+         permutations = 999, method = "bray")
+
+
+
+nmds_biomass <- metaMDS(data.matrix(total_values_tg_site_biomass_exclude[,3:9]), distance="bray")
+humF_biomass <- envfit(nmds_biomass, human_factors, permutations = 999,na.rm = T)
+
+plot(nmds_biomass)
+plot(humF_biomass)
+
+scores_biomass <- as.data.frame(scores(nmds_biomass))
+scores_biomass$sites <- total_values_tg_site_biomass$sites
+scores_biomass$locality <- total_values_tg_site_biomass$locality
+
+en_coord_cont_biomass <- as.data.frame(scores(humF_biomass, "vectors")) * ordiArrowMul(humF_biomass)
+rownames(en_coord_cont_biomass) <- c("Marke Distance","Protection status","Number fishermen")
+en_coord_cat_biomass <- as.data.frame(scores(humF_biomass, "factors")) * ordiArrowMul(humF_biomass)
+rownames(en_coord_cat_biomass) <- c("B. Sol","C. Cor","C. Mar","Cupica","G. Tri","Gorg")
+
+scores_trg <- as.data.frame(nmds_biomass$species)
+rownames(scores_trg) <- c("PS","HD","HM","IM","IS","OM","PK")
+
+Fig4C<- ggplot(data = scores_biomass, aes(x = NMDS1, y = NMDS2)) + 
+  #geom_point(size = 2, alpha = 0.5, color="navy") + 
+  geom_segment(aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2), 
+               data = en_coord_cont_biomass, size =1, alpha = 0.5, colour = "grey30") +
+  geom_segment(aes(x = 0, y = 0, xend = MDS1, yend = MDS2), 
+               data = scores_trg, size =1, alpha = 0.5, colour = "red")+
+  geom_point(data = en_coord_cat_biomass, aes(x = NMDS1, y = NMDS2, color=rownames(en_coord_cat_biomass)), 
+             shape = "diamond", size = 5, alpha = 0.6) +
+  geom_text(data = en_coord_cont_biomass, aes(x = NMDS1, y = NMDS2+0.04), 
+            label = row.names(en_coord_cont_biomass), colour = "navy", fontface = "bold")+
+  geom_text(data = en_coord_cat_biomass, aes(x = NMDS1, y = NMDS2+0.03), colour = "grey30", 
+            fontface = "bold", label = row.names(en_coord_cat_biomass))+
+  geom_text(data = scores_trg, aes(x = MDS1, y = MDS2), colour = "grey30", 
+            fontface = "bold", label = row.names(scores_trg))+
+  theme_bw()+
+  theme(legend.position = "none")
+
+ggarrange(Fig4A, Fig4B, Fig4C, labels = c("A", "B", "C"), 
+          ncol = 3, nrow = 1)
+
+
+# nMDS excluding Malpelo 
+
+
+
+
+# 9. Additional Figures -----------------------------------------------
+if(!require(viridis)){install.packages('viridis'); library(viridis)}
+if(!require(visreg)){install.packages('visreg'); library(visreg)}
+
+visreg(model_density, "Dmarket_scale",
+       ylab="Log[Density (ind/m2)]", xlab="Distance Market", overlay = TRUE, 
+       gg = TRUE, points=list(size=proportions(mean_summary_site$mean_density)*200,
+                              pch=20, alpha=0.7)) +
+  theme_bw()
+
+visreg(model_biomass, "Dmarket_scale",
+       ylab="Log[Biomass (g/m2)]", xlab="Distance Market", overlay = TRUE, 
+       gg = TRUE, points=list(size=proportions(mean_summary_site$mean_biomass)*200, 
+                              pch=20, alpha=0.7))+
+  theme_bw()
+
+
+Fig3A<-ggplot (mean_summary_site, aes(x=locality, y=mean_density, fill=locality, alpha=0.5))+
+  geom_boxplot() +
+  labs (x="Locality", y=expression(paste("Density (ind/"~m^2, ")")))+
+  scale_x_discrete(limit=c("bahia_solano","cabo_corrientes","cabo_marzo","cupica","golfo_tribuga","gorgona","malpelo"),
+                   labels=c("B. Sol","C. Cor","C. Mar","Cupica","G. Tri","Gorg","Malp"))+
+  theme_bw()+
+  theme (legend.position = "none")
+
+Fig3B<-ggplot (total_values_sites, aes(x=locality, y=mean_biomass, fill=locality, alpha=0.5))+
+  geom_boxplot() +
+  labs (x="Locality", y=expression(paste("Biomass (g/"~m^2, ")")))+
+  scale_x_discrete(limit=c("bahia_solano","cabo_corrientes","cabo_marzo","cupica","golfo_tribuga","gorgona","malpelo"),
+                   labels=c("B. Sol","C. Cor","C. Mar","Cupica","G. Tri","Gorg","Malp"))+
+  theme_bw()+
+  theme (legend.position = "none")
+
+Fig3C<- ggplot (total_values_sites, aes(x=log(Dmarket_scale),y=mean_density, 
+                                        size=(mean_biomass/100)))+
+  geom_point(aes(alpha = "Observed", color=locality),alpha = 0.5)+
+  geom_smooth(method = glm, formula = y ~x, se=T, show_guide=F) +
+  labs(y=expression(paste("Density (ind/"~m^2,")")),
+       x=expression(paste(""["Log"]," ","Market distance (Km)")),
+       size="%Density", fill="Location")+
+  theme_bw()+
+  theme (legend.position = "none")
+
+Fig3D<- ggplot (total_values_sites, aes(x=log(Dmarket_scale),y=mean_biomass, 
+                                        size=(mean_biomass/100)))+
+  geom_point(aes(alpha = "Observed", color=locality),alpha = 0.5)+
+  geom_smooth(method = glm, formula = y ~x, se=T, show_guide=F) +
+  labs(y=expression(paste("Biomass (g/"~m^2,")")),
+       x=expression(paste(""["Log"]," ","Market distance (Km)")),
+       size="%Biomass", fill="Location")+
+  theme_bw()+
+  theme (legend.position = "none")
+
+
+ggarrange(Fig3A, Fig3C,
+          Fig3B, Fig3D, 
+          labels = c("A", "C", "B", "D"),
+          ncol = 2, nrow = 2)
+
 
